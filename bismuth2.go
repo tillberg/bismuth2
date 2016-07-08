@@ -17,64 +17,33 @@ import (
 const maxSessionsPerContext = 5
 const networkTimeout = 15 * time.Second
 
+type Session struct {
+	*exec.Cmd
+}
+
+func NewLocalSession() *Session {
+	return &Session{
+		Cmd: &exec.Cmd{},
+	}
+}
+
 type ExecContext struct {
 	Verbose bool
 
-	mutex      sync.Mutex
-	sessions   []*Session
-	numWaiting int
-	poolDone   chan bool
-	logger     *alog.Logger
-	logPrefix  string
+	mutex     sync.Mutex
+	sessions  []*Session
+	logger    *alog.Logger
+	logPrefix string
 }
-
-var onceInit sync.Once
 
 func New() *ExecContext {
 	ctx := &ExecContext{}
-	ctx.poolDone = make(chan bool)
 	ctx.logger = ctx.newLogger("")
 	return ctx
 }
 
 func (ctx *ExecContext) lock()   { ctx.mutex.Lock() }
 func (ctx *ExecContext) unlock() { ctx.mutex.Unlock() }
-
-const killTimeout = 2 * time.Second
-
-func (ctx *ExecContext) KillAllSessions() {
-	panic("KillAllSessions not implemented")
-	// status := ctx.Logger()
-	// ctx.lock()
-	// if !ctx.isConnected {
-	// 	// There's no sense in trying to kill sessions from a dead connection
-	// 	ctx.unlock()
-	// 	return
-	// }
-	// sessions := ctx.sessions
-	// ctx.unlock()
-	// sessionClosedChan := make(chan bool, len(sessions))
-	// for _, session := range sessions {
-	// 	// session.OnClose(sessionClosedChan)
-	// 	pid := session.Pid()
-	// 	if pid > 0 {
-	// 		err := syscall.Kill(pid, syscall.SIGTERM)
-	// 		if err != nil {
-	// 			status.Printf("Failed to kill process %d: %v\n", pid, err)
-	// 		}
-	// 	}
-	// }
-	// timeoutChan := time.After(killTimeout)
-	// for _, _ = range sessions {
-	// 	select {
-	// 	case <-sessionClosedChan:
-	// 		break
-	// 	case <-timeoutChan:
-	// 		status.Printf("@(error:Timed out in KillAllSessions while waiting for processes to exit.)\n")
-	// 		return
-	// 	}
-	// }
-}
 
 func (ctx *ExecContext) SetLogPrefix(prefix string) {
 	ctx.lock()
