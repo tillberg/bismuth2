@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gonuts/go-shellquote"
 	"github.com/tillberg/ansi-log"
 )
 
@@ -97,9 +96,7 @@ func (ctx *ExecContext) startSession(setupFns []SessionSetupFn, errChan chan err
 	}
 	pid := session.Process.Pid
 	if ctx.Verbose {
-		dirStr := shellquote.Join(session.Dir)
-		cmdShell := shellquote.Join(session.Args...)
-		ctx.logger.Printf("@(dim:$ cd) %s @(dim:&&) %s @(dim:-> pid) @(blue:%d)\n", dirStr, cmdShell, pid)
+		ctx.logger.Printf("@(dim:$ cd) %q @(dim:&&) %q @(dim:-> pid) @(blue:%d)\n", session.Dir, session.Args, pid)
 	}
 	go func() {
 		// We need to finish reading from stdout/stderr before calling Wait:
