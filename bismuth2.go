@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tillberg/ansi-log"
+	"github.com/tillberg/alog"
 )
 
 const maxSessionsPerContext = 5
