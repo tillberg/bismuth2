@@ -6,8 +6,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tillberg/alog"
@@ -16,21 +19,11 @@ import (
 const maxSessionsPerContext = 5
 const networkTimeout = 15 * time.Second
 
-type Session struct {
-	*exec.Cmd
-}
-
-func NewLocalSession() *Session {
-	return &Session{
-		Cmd: &exec.Cmd{},
-	}
-}
-
 type ExecContext struct {
 	Verbose bool
 
 	mutex     sync.Mutex
-	sessions  []*Session
+	sessions  []*exec.Cmd
 	logger    *alog.Logger
 	logPrefix string
 }
@@ -73,10 +66,10 @@ func (ctx *ExecContext) Logger() *alog.Logger {
 	return ctx.logger
 }
 
-type SessionSetupFn func(session *Session, finished chan error) error
+type SessionSetupFn func(session *exec.Cmd, finished chan error) error
 
 func (ctx *ExecContext) startSession(setupFns []SessionSetupFn, errChan chan error) {
-	session := NewLocalSession()
+	session := &exec.Cmd{}
 	finished := make(chan error, len(setupFns))
 	var err error
 	for _, setupFn := range setupFns {
@@ -117,7 +110,7 @@ func (ctx *ExecContext) startSession(setupFns []SessionSetupFn, errChan chan err
 }
 
 func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (errChan chan error) {
-	errChan = make(chan error, 1)
+	errChan = make(chan error, len(setupFns))
 	go ctx.startSession(setupFns, errChan)
 	return errChan
 }
@@ -129,7 +122,7 @@ func (ctx *ExecContext) ExecSession(setupFns ...SessionSetupFn) (err error) {
 }
 
 func (ctx *ExecContext) SessionQuoteOut(suffix string) SessionSetupFn {
-	fn := func(session *Session, finished chan error) error {
+	fn := func(session *exec.Cmd, finished chan error) error {
 		logger := ctx.newLogger(suffix)
 		stdout, err := session.StdoutPipe()
 		go func() {
@@ -154,7 +147,7 @@ func (ctx *ExecContext) SessionQuoteOut(suffix string) SessionSetupFn {
 }
 
 func (ctx *ExecContext) SessionQuoteErr(suffix string) SessionSetupFn {
-	fn := func(session *Session, finished chan error) error {
+	fn := func(session *exec.Cmd, finished chan error) error {
 		logger := ctx.newLogger(suffix)
 		stderr, err := session.StderrPipe()
 		go func() {
@@ -179,7 +172,7 @@ func (ctx *ExecContext) SessionQuoteErr(suffix string) SessionSetupFn {
 }
 
 // func SessionShell(cmd string) SessionSetupFn {
-// 	fn := func(session *Session, finished chan error) error {
+// 	fn := func(session *exec.Cmd, finished chan error) error {
 // 		session.SetCmdShell(cmd)
 // 		go func() {
 // 			finished <- nil
@@ -190,7 +183,7 @@ func (ctx *ExecContext) SessionQuoteErr(suffix string) SessionSetupFn {
 // }
 
 func SessionArgs(args ...string) SessionSetupFn {
-	fn := func(session *Session, finished chan error) error {
+	fn := func(session *exec.Cmd, finished chan error) error {
 		path, err := exec.LookPath(args[0])
 		if err != nil {
 			return err
@@ -206,8 +199,8 @@ func SessionArgs(args ...string) SessionSetupFn {
 }
 
 func SessionCwd(cwd string) SessionSetupFn {
-	fn := func(session *Session, finished chan error) error {
-		session.Cmd.Dir = cwd
+	fn := func(session *exec.Cmd, finished chan error) error {
+		session.Dir = cwd
 		go func() {
 			finished <- nil
 		}()
@@ -216,15 +209,9 @@ func SessionCwd(cwd string) SessionSetupFn {
 	return fn
 }
 
-type BufferCloser struct {
-	bytes.Buffer
-}
-
-func (b BufferCloser) Close() error { return nil }
-
-func copyStdoutAndErr(session *Session, stdout io.Writer, stderr io.Writer, finished chan error) error {
+func copyStdoutAndErr(session *exec.Cmd, stdout io.Writer, stderr io.Writer, finished chan error) error {
 	myReady := make(chan error)
-	copyStream := func(session *Session, getPipe func(*Session) (io.ReadCloser, error), writer io.Writer) error {
+	copyStream := func(session *exec.Cmd, getPipe func(*exec.Cmd) (io.ReadCloser, error), writer io.Writer) error {
 		reader, err := getPipe(session)
 		go func() {
 			if err != nil {
@@ -240,8 +227,8 @@ func copyStdoutAndErr(session *Session, stdout io.Writer, stderr io.Writer, fini
 		}()
 		return err
 	}
-	err1 := copyStream(session, (*Session).StdoutPipe, stdout)
-	err2 := copyStream(session, (*Session).StderrPipe, stderr)
+	err1 := copyStream(session, (*exec.Cmd).StdoutPipe, stdout)
+	err2 := copyStream(session, (*exec.Cmd).StderrPipe, stderr)
 	go func() {
 		var err error
 		for i := 0; i < 2; i++ {
@@ -260,19 +247,15 @@ func copyStdoutAndErr(session *Session, stdout io.Writer, stderr io.Writer, fini
 
 func SessionBuffer() (SessionSetupFn, chan []byte) {
 	bufChan := make(chan []byte, 2)
-	fn := func(session *Session, finished chan error) error {
-		var bufOut BufferCloser
-		var bufErr BufferCloser
+	fn := func(session *exec.Cmd, finished chan error) error {
+		var bufOut bytes.Buffer
+		var bufErr bytes.Buffer
 		myReady := make(chan error)
 		err := copyStdoutAndErr(session, &bufOut, &bufErr, myReady)
 		go func() {
 			err := <-myReady
-			go func() {
-				bufChan <- bufOut.Bytes()
-				go func() {
-					bufChan <- bufErr.Bytes()
-				}()
-			}()
+			bufChan <- bufOut.Bytes()
+			bufChan <- bufErr.Bytes()
 			finished <- err
 		}()
 		return err
@@ -281,7 +264,7 @@ func SessionBuffer() (SessionSetupFn, chan []byte) {
 }
 
 func SessionPipeStdout(chanStdout chan io.Reader) SessionSetupFn {
-	return func(session *Session, finished chan error) error {
+	return func(session *exec.Cmd, finished chan error) error {
 		stdout, err := session.StdoutPipe()
 		go func() {
 			chanStdout <- stdout
@@ -293,7 +276,7 @@ func SessionPipeStdout(chanStdout chan io.Reader) SessionSetupFn {
 }
 
 func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
-	return func(session *Session, finished chan error) error {
+	return func(session *exec.Cmd, finished chan error) error {
 		stdin, err := session.StdinPipe()
 		go func() {
 			chanStdin <- stdin
@@ -303,8 +286,71 @@ func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
 	}
 }
 
+func SessionKillChan(ch chan struct{}) SessionSetupFn {
+	return func(session *exec.Cmd, finished chan error) error {
+		// This probably leaks goroutines
+		go func() {
+			<-ch
+			// alog.Println("Killing process")
+			// Is this concurrent-safe?
+			session.Process.Kill()
+			// alog.Println("Killed", session.Process.Pid, err)
+		}()
+		go func() {
+			finished <- nil
+		}()
+		return nil
+	}
+}
+
+func LookupUser(username string) (uint32, uint32, []uint32, error) {
+	_user, err := user.Lookup(username)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	uid, err := strconv.Atoi(_user.Uid)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	gid, err := strconv.Atoi(_user.Gid)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	gidStrs, err := _user.GroupIds()
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	gids := []uint32{}
+	for _, gidStr := range gidStrs {
+		_gid, err := strconv.Atoi(gidStr)
+		if err != nil {
+			return 0, 0, nil, err
+		}
+		gids = append(gids, uint32(_gid))
+	}
+	return uint32(uid), uint32(gid), gids, nil
+}
+
+func SessionUser(user string) SessionSetupFn {
+	return func(session *exec.Cmd, finished chan error) error {
+		uid, gid, gids, err := LookupUser(user)
+		if err != nil {
+			return fmt.Errorf("Error looking up user %q: %v\n", user, err)
+		}
+		// alog.Println("USER", uid, gid, gids)
+		session.SysProcAttr = &syscall.SysProcAttr{}
+		session.SysProcAttr.Credential = &syscall.Credential{Uid: uid, Gid: gid}
+		// This only works on Linux:
+		session.SysProcAttr.Credential.Groups = gids
+		go func() {
+			finished <- nil
+		}()
+		return nil
+	}
+}
+
 // func SessionSetStdin(reader io.Reader) SessionSetupFn {
-// 	return func(session *Session, finished chan error) error {
+// 	return func(session *exec.Cmd, finished chan error) error {
 // 		session.SetStdin(reader)
 // 		go func() {
 // 			finished <- nil
@@ -314,7 +360,7 @@ func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
 // }
 
 // func SessionInteractive() SessionSetupFn {
-// 	return func(session *Session, finished chan error) error {
+// 	return func(session *exec.Cmd, finished chan error) error {
 // 		session.SetStdin(os.Stdin)
 // 		err := copyStdoutAndErr(session, os.Stdout, os.Stderr, finished)
 // 		return err
@@ -325,9 +371,9 @@ func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
 // 	return ctx.ExecSession(ctx.SessionQuoteErr(suffix), SessionPipeStdout(chanStdout), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
 // }
 
-// func (ctx *ExecContext) QuoteCwdPipeIn(suffix string, cwd string, chanStdin chan io.WriteCloser, args ...string) (err error) {
-// 	return ctx.ExecSession(ctx.SessionQuoteOut(suffix), ctx.SessionQuoteErr(suffix), SessionPipeStdin(chanStdin), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
-// }
+func (ctx *ExecContext) QuoteCwdPipeIn(suffix string, cwd string, chanStdin chan io.WriteCloser, args ...string) (err error) {
+	return ctx.ExecSession(SessionCwd(ctx.AbsPath(cwd)), SessionPipeStdin(chanStdin), SessionArgs(args...), ctx.SessionQuoteOut(suffix), ctx.SessionQuoteErr(suffix))
+}
 
 // func (ctx *ExecContext) QuoteCwdPipeInOut(suffix string, cwd string, chanStdin chan io.WriteCloser, chanStdout chan io.Reader, args ...string) (err error) {
 // 	return ctx.ExecSession(ctx.SessionQuoteErr(suffix), SessionPipeStdin(chanStdin), SessionPipeStdout(chanStdout), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
@@ -361,6 +407,39 @@ func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) (err
 // 	return ctx.StartSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuoteOut(suffix), ctx.SessionQuoteErr(suffix))
 // }
 
+type Opts struct {
+	Quote     string
+	Cwd       string
+	User      string
+	StdinChan chan io.WriteCloser
+	Args      []string
+	KillChan  chan struct{}
+}
+
+func (ctx *ExecContext) Run(opts Opts) error {
+	fns := []SessionSetupFn{}
+	if opts.Quote != "" {
+		fns = append(fns, ctx.SessionQuoteOut(opts.Quote))
+		fns = append(fns, ctx.SessionQuoteErr(opts.Quote))
+	}
+	if opts.Cwd != "" {
+		fns = append(fns, SessionCwd(ctx.AbsPath(opts.Cwd)))
+	}
+	if opts.StdinChan != nil {
+		fns = append(fns, SessionPipeStdin(opts.StdinChan))
+	}
+	if opts.KillChan != nil {
+		fns = append(fns, SessionKillChan(opts.KillChan))
+	}
+	if len(opts.Args) != 0 {
+		fns = append(fns, SessionArgs(opts.Args...))
+	}
+	if opts.User != "" {
+		fns = append(fns, SessionUser(opts.User))
+	}
+	return ctx.ExecSession(fns...)
+}
+
 func (ctx *ExecContext) Quote(suffix string, args ...string) (err error) {
 	err = ctx.ExecSession(SessionArgs(args...), ctx.SessionQuoteOut(suffix), ctx.SessionQuoteErr(suffix))
 	return err
@@ -380,20 +459,14 @@ func (ctx *ExecContext) Quote(suffix string, args ...string) (err error) {
 func (ctx *ExecContext) RunCwd(cwd string, args ...string) (stdout []byte, stderr []byte, err error) {
 	bufSetup, bufChan := SessionBuffer()
 	err = ctx.ExecSession(bufSetup, SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
-	if err != nil {
-		return nil, nil, err
-	}
 	stdout = <-bufChan
 	stderr = <-bufChan
 	return stdout, stderr, err
 }
 
-func (ctx *ExecContext) Run(args ...string) (stdout []byte, stderr []byte, err error) {
+func (ctx *ExecContext) RunLegacy(args ...string) (stdout []byte, stderr []byte, err error) {
 	bufSetup, bufChan := SessionBuffer()
 	err = ctx.ExecSession(bufSetup, SessionArgs(args...))
-	if err != nil {
-		return nil, nil, err
-	}
 	stdout = <-bufChan
 	stderr = <-bufChan
 	return stdout, stderr, err
